@@ -1,3 +1,4 @@
 AirPodsAutoSwitch.config.json
 AirPodsAutoSwitchApp.sed
+build/
 *.log
