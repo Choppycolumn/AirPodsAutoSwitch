@@ -12,7 +12,9 @@ param(
     [switch]$SetCommunicationsDefault,
     [switch]$ListDevices,
     [switch]$Once,
-    [switch]$LoadOnly
+    [switch]$LoadOnly,
+    [switch]$ConnectNow,
+    [switch]$DisconnectNow
 )
 
 Set-StrictMode -Version 2.0
@@ -757,6 +759,18 @@ if ($ListDevices) {
     $peak = [AirPodsSwitch.AudioTools]::GetDefaultRenderPeak()
     Write-Host ""
     Write-Host ("Current default render peak: {0:N4}" -f $peak)
+    exit 0
+}
+
+if ($ConnectNow) {
+    Connect-MatchedHeadphones
+    exit 0
+}
+
+if ($DisconnectNow) {
+    Write-Host "Disconnecting Bluetooth audio service for '$DeviceNamePattern'..."
+    $off = [AirPodsSwitch.BluetoothTools]::SetAudioStateByName($DeviceNamePattern, $false, [bool]$SetCommunicationsDefault)
+    Write-OperationResults $off
     exit 0
 }
 

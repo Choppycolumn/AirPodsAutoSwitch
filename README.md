@@ -33,6 +33,18 @@ Double-click:
 Start-AirPodsAutoSwitchApp.cmd
 ```
 
+Or build a single executable package:
+
+```powershell
+.\Build-AppPackage.ps1
+```
+
+The generated package is written to:
+
+```text
+dist\AirPodsAutoSwitchApp.exe
+```
+
 In the app:
 
 - Pick `所有 AirPods` to let Windows try every paired AirPods-like device, or pick
@@ -40,6 +52,9 @@ In the app:
 - Click `开启自动切换` / `关闭自动切换` to turn the watcher on or off.
 - Click `立即连接` to test the selected device immediately.
 - Close the window while auto switch is running to keep it in the system tray.
+
+Settings are saved in `%APPDATA%\AirPodsAutoSwitchApp\config.json`, so they also
+persist when the app is launched from the packaged `.exe`.
 
 ### Command line
 

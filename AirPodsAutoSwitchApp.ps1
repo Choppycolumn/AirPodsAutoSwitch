@@ -15,7 +15,11 @@ Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false)
 
-$configPath = Join-Path $scriptRoot "AirPodsAutoSwitch.config.json"
+$appDataRoot = Join-Path ([Environment]::GetFolderPath("ApplicationData")) "AirPodsAutoSwitchApp"
+if (-not (Test-Path $appDataRoot)) {
+    [void](New-Item -Path $appDataRoot -ItemType Directory -Force)
+}
+$configPath = Join-Path $appDataRoot "config.json"
 $script:Monitoring = $false
 $script:Busy = $false
 $script:AllowExit = $false
@@ -23,6 +27,9 @@ $script:ConsecutiveActive = 0
 $script:LastConnect = [DateTime]::MinValue
 $script:LastLocalAudio = [DateTime]::MinValue
 $script:IdleDisconnectDone = $false
+$script:TriggerArmed = $true
+$script:ActionProcess = $null
+$script:ActionKind = $null
 
 function Get-DefaultConfig {
     [pscustomobject]@{
@@ -57,7 +64,12 @@ function Read-AppConfig {
 }
 
 function Write-AppConfig {
-    $config = [pscustomobject]@{
+    $config = Get-CurrentSettings
+    $config | ConvertTo-Json | Set-Content -Path $configPath -Encoding UTF8
+}
+
+function Get-CurrentSettings {
+    [pscustomobject]@{
         DeviceNamePattern = $devicePatternBox.Text.Trim()
         AudioEndpointNamePattern = $endpointPatternBox.Text.Trim()
         PeakThreshold = [double]($thresholdBox.Value)
@@ -69,8 +81,6 @@ function Write-AppConfig {
         IdleDisconnectSeconds = [int]($idleSecondsBox.Value)
         SetCommunicationsDefault = [bool]$communicationsBox.Checked
     }
-
-    $config | ConvertTo-Json | Set-Content -Path $configPath -Encoding UTF8
 }
 
 function Add-LogLine {
@@ -152,77 +162,170 @@ function Refresh-Devices {
     }
 }
 
-function Connect-SelectedHeadphones {
-    $pattern = $devicePatternBox.Text.Trim()
-    $endpointPattern = $endpointPatternBox.Text.Trim()
-    if (-not $pattern) {
+function ConvertTo-ProcessArgument {
+    param([string]$Value)
+
+    if ($null -eq $Value) {
+        return '""'
+    }
+
+    return '"' + ($Value -replace '"', '`"') + '"'
+}
+
+function Set-ActionUiState {
+    param(
+        [bool]$Running,
+        [string]$StatusText
+    )
+
+    $script:Busy = $Running
+    $connectNowButton.Enabled = -not $Running
+    if ($Running) {
+        $statusValueLabel.Text = $StatusText
+        $statusValueLabel.ForeColor = [System.Drawing.Color]::FromArgb(190, 122, 0)
+    } else {
+        Sync-ToggleText
+    }
+}
+
+function Start-CoreAction {
+    param(
+        [ValidateSet("connect", "disconnect")]
+        [string]$ActionKind
+    )
+
+    if ($script:ActionProcess -and -not $script:ActionProcess.HasExited) {
+        Add-LogLine "已有蓝牙操作正在进行，请稍等"
+        return
+    }
+
+    $settings = Get-CurrentSettings
+    if (-not $settings.DeviceNamePattern) {
         Add-LogLine "请先填写蓝牙设备匹配名称"
         return
     }
 
     Write-AppConfig
-    $script:Busy = $true
-    $toggleButton.Enabled = $false
-    $connectNowButton.Enabled = $false
-    $statusValueLabel.Text = "连接中"
+
+    $argumentParts = @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", (ConvertTo-ProcessArgument $coreScript),
+        "-DeviceNamePattern", (ConvertTo-ProcessArgument $settings.DeviceNamePattern),
+        "-AudioEndpointNamePattern", (ConvertTo-ProcessArgument $settings.AudioEndpointNamePattern),
+        "-PeakThreshold", ([string]$settings.PeakThreshold),
+        "-ActiveSamples", ([string]$settings.ActiveSamples),
+        "-PollMs", ([string]$settings.PollMs),
+        "-CooldownSeconds", ([string]$settings.CooldownSeconds)
+    )
+
+    if ($ActionKind -eq "connect") {
+        $argumentParts += "-ConnectNow"
+        if ($settings.ForceReconnect) {
+            $argumentParts += "-ForceReconnect"
+        }
+    } else {
+        $argumentParts += "-DisconnectNow"
+    }
+
+    if ($settings.SetCommunicationsDefault) {
+        $argumentParts += "-SetCommunicationsDefault"
+    }
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = "powershell.exe"
+    $psi.Arguments = ($argumentParts -join " ")
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $psi
 
     try {
-        if ($forceReconnectBox.Checked) {
-            Add-LogLine "正在刷新蓝牙音频服务..."
-            $off = [AirPodsSwitch.BluetoothTools]::SetAudioStateByName(
-                $pattern,
-                $false,
-                [bool]$communicationsBox.Checked)
-            Add-LogLine (Format-OperationResults $off)
-            Start-Sleep -Milliseconds 500
+        [void]$process.Start()
+        $script:ActionProcess = $process
+        $script:ActionKind = $ActionKind
+        if ($ActionKind -eq "connect") {
+            Set-ActionUiState $true "连接中"
+            Add-LogLine ("正在后台连接：{0}" -f $settings.DeviceNamePattern)
+        } else {
+            Set-ActionUiState $true "断开中"
+            Add-LogLine ("正在后台断开：{0}" -f $settings.DeviceNamePattern)
         }
-
-        Add-LogLine ("正在连接：{0}" -f $pattern)
-        $on = [AirPodsSwitch.BluetoothTools]::SetAudioStateByName(
-            $pattern,
-            $true,
-            [bool]$communicationsBox.Checked)
-        Add-LogLine (Format-OperationResults $on)
-
-        Start-Sleep -Milliseconds 1800
-        if ($endpointPattern) {
-            $switched = [AirPodsSwitch.AudioTools]::SetDefaultRenderEndpointByName(
-                $endpointPattern,
-                [bool]$communicationsBox.Checked)
-            if ($switched) {
-                Add-LogLine ("已切换默认输出：{0}" -f $endpointPattern)
-            } else {
-                Add-LogLine ("还没找到可用输出端点：{0}" -f $endpointPattern)
-            }
-        }
+        $actionPollTimer.Start()
     } catch {
-        Add-LogLine ("连接失败：{0}" -f $_.Exception.Message)
-    } finally {
-        $script:LastConnect = Get-Date
-        $script:ConsecutiveActive = 0
-        $script:Busy = $false
-        $toggleButton.Enabled = $true
-        $connectNowButton.Enabled = $true
-        Sync-ToggleText
+        if ($process) {
+            $process.Dispose()
+        }
+        $script:ActionProcess = $null
+        $script:ActionKind = $null
+        Set-ActionUiState $false ""
+        Add-LogLine ("启动蓝牙操作失败：{0}" -f $_.Exception.Message)
     }
 }
 
-function Disconnect-SelectedHeadphones {
-    $pattern = $devicePatternBox.Text.Trim()
-    if (-not $pattern) {
+function Complete-CoreActionIfReady {
+    if (-not $script:ActionProcess) {
+        $actionPollTimer.Stop()
         return
     }
 
-    try {
-        Add-LogLine ("空闲超时，正在断开：{0}" -f $pattern)
-        $off = [AirPodsSwitch.BluetoothTools]::SetAudioStateByName(
-            $pattern,
-            $false,
-            [bool]$communicationsBox.Checked)
-        Add-LogLine (Format-OperationResults $off)
-    } catch {
-        Add-LogLine ("断开失败：{0}" -f $_.Exception.Message)
+    if (-not $script:ActionProcess.HasExited) {
+        return
     }
+
+    $actionPollTimer.Stop()
+    $process = $script:ActionProcess
+    $kind = $script:ActionKind
+    $script:ActionProcess = $null
+    $script:ActionKind = $null
+
+    try {
+        $output = $process.StandardOutput.ReadToEnd()
+        $errorText = $process.StandardError.ReadToEnd()
+        foreach ($line in ($output -split "`r?`n")) {
+            if ($line.Trim()) {
+                Add-LogLine $line.Trim()
+            }
+        }
+        foreach ($line in ($errorText -split "`r?`n")) {
+            if ($line.Trim()) {
+                Add-LogLine ("错误：{0}" -f $line.Trim())
+            }
+        }
+
+        if ($process.ExitCode -eq 0) {
+            if ($kind -eq "connect") {
+                $script:LastConnect = Get-Date
+                $script:ConsecutiveActive = 0
+                $script:TriggerArmed = $false
+                Add-LogLine "连接流程已完成；本次播放停止前不会再次重复连接"
+            } else {
+                $script:IdleDisconnectDone = $true
+                Add-LogLine "断开流程已完成"
+            }
+        } else {
+            Add-LogLine ("蓝牙操作退出码：{0}" -f $process.ExitCode)
+        }
+    } catch {
+        Add-LogLine ("读取蓝牙操作结果失败：{0}" -f $_.Exception.Message)
+    } finally {
+        $process.Dispose()
+        Set-ActionUiState $false ""
+        if ($script:Monitoring) {
+            $timer.Start()
+        }
+    }
+}
+
+function Connect-SelectedHeadphones {
+    Start-CoreAction "connect"
+}
+
+function Disconnect-SelectedHeadphones {
+    Start-CoreAction "disconnect"
 }
 
 function Start-Monitoring {
@@ -232,6 +335,7 @@ function Start-Monitoring {
     $script:ConsecutiveActive = 0
     $script:LastConnect = [DateTime]::MinValue
     $script:IdleDisconnectDone = $false
+    $script:TriggerArmed = $true
     Sync-ToggleText
     $timer.Start()
     Add-LogLine "自动切换已开启"
@@ -241,6 +345,7 @@ function Stop-Monitoring {
     $timer.Stop()
     $script:Monitoring = $false
     $script:ConsecutiveActive = 0
+    $script:TriggerArmed = $true
     Sync-ToggleText
     Add-LogLine "自动切换已关闭"
 }
@@ -491,6 +596,9 @@ $notifyIcon.Visible = $true
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = [Math]::Max(250, [int]$config.PollMs)
 
+$actionPollTimer = New-Object System.Windows.Forms.Timer
+$actionPollTimer.Interval = 500
+
 $deviceCombo.Add_SelectedIndexChanged({
     $selected = [string]$deviceCombo.SelectedItem
     if (-not $selected) {
@@ -518,9 +626,17 @@ $hideButton.Add_Click({ $form.Hide() })
 $showTrayItem.Add_Click({ Show-MainWindow })
 $toggleTrayItem.Add_Click({ Toggle-Monitoring })
 $notifyIcon.Add_DoubleClick({ Show-MainWindow })
+$actionPollTimer.Add_Tick({ Complete-CoreActionIfReady })
 $exitTrayItem.Add_Click({
     $script:AllowExit = $true
     $timer.Stop()
+    $actionPollTimer.Stop()
+    if ($script:ActionProcess -and -not $script:ActionProcess.HasExited) {
+        try {
+            $script:ActionProcess.Kill()
+        } catch {
+        }
+    }
     $notifyIcon.Visible = $false
     $form.Close()
 })
@@ -532,6 +648,13 @@ $form.Add_FormClosing({
         $notifyIcon.ShowBalloonTip(1200, "AirPods Auto Switch", "自动切换仍在后台运行", [System.Windows.Forms.ToolTipIcon]::Info)
     } else {
         $timer.Stop()
+        $actionPollTimer.Stop()
+        if ($script:ActionProcess -and -not $script:ActionProcess.HasExited) {
+            try {
+                $script:ActionProcess.Kill()
+            } catch {
+            }
+        }
         $notifyIcon.Visible = $false
         Write-AppConfig
     }
@@ -558,16 +681,15 @@ $timer.Add_Tick({
             $script:IdleDisconnectDone = $false
         } else {
             $script:ConsecutiveActive = 0
+            $script:TriggerArmed = $true
         }
 
         $cooldownPassed = (($now - $script:LastConnect).TotalSeconds -ge [int]$cooldownBox.Value)
-        if ($script:ConsecutiveActive -ge [int]$activeSamplesBox.Value -and $cooldownPassed) {
+        if ($script:TriggerArmed -and $script:ConsecutiveActive -ge [int]$activeSamplesBox.Value -and $cooldownPassed) {
             Add-LogLine ("检测到本机播放，峰值 {0:N3}" -f $peak)
+            $script:TriggerArmed = $false
             $timer.Stop()
             Connect-SelectedHeadphones
-            if ($script:Monitoring) {
-                $timer.Start()
-            }
             return
         }
 
@@ -576,10 +698,6 @@ $timer.Add_Tick({
             if ($idleSeconds -ge [int]$idleSecondsBox.Value) {
                 $timer.Stop()
                 Disconnect-SelectedHeadphones
-                $script:IdleDisconnectDone = $true
-                if ($script:Monitoring) {
-                    $timer.Start()
-                }
             }
         }
     } catch {
@@ -595,6 +713,7 @@ if ($SmokeTest) {
     Write-Output ("OK: app loaded; device choices={0}" -f $deviceCombo.Items.Count)
     $notifyIcon.Visible = $false
     $notifyIcon.Dispose()
+    $actionPollTimer.Dispose()
     $timer.Dispose()
     $form.Dispose()
     exit 0
@@ -603,5 +722,7 @@ if ($SmokeTest) {
 [System.Windows.Forms.Application]::Run($form)
 
 $notifyIcon.Dispose()
+$actionPollTimer.Dispose()
 $timer.Dispose()
+
 
