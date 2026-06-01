@@ -301,13 +301,17 @@ function Complete-CoreActionIfReady {
                 $script:LastConnect = Get-Date
                 $script:ConsecutiveActive = 0
                 $script:TriggerArmed = $false
-                Add-LogLine "连接流程已完成；本次播放停止前不会再次重复连接"
+                Add-LogLine "连接已验证；默认输出已切到目标设备"
             } else {
                 $script:IdleDisconnectDone = $true
                 Add-LogLine "断开流程已完成"
             }
         } else {
-            Add-LogLine ("蓝牙操作退出码：{0}" -f $process.ExitCode)
+            if ($kind -eq "connect") {
+                Add-LogLine ("连接未确认成功；默认输出没有切到目标设备，退出码：{0}" -f $process.ExitCode)
+            } else {
+                Add-LogLine ("蓝牙操作退出码：{0}" -f $process.ExitCode)
+            }
         }
     } catch {
         Add-LogLine ("读取蓝牙操作结果失败：{0}" -f $_.Exception.Message)

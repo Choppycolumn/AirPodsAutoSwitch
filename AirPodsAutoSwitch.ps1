@@ -14,7 +14,9 @@ param(
     [switch]$Once,
     [switch]$LoadOnly,
     [switch]$ConnectNow,
-    [switch]$DisconnectNow
+    [switch]$DisconnectNow,
+    [int]$EndpointReadyTimeoutSeconds = 10,
+    [int]$EndpointRetryMs = 700
 )
 
 Set-StrictMode -Version 2.0
@@ -413,6 +415,45 @@ namespace AirPodsSwitch
             return records;
         }
 
+        public static AudioEndpointRecord GetDefaultRenderEndpoint()
+        {
+            IMMDeviceEnumerator enumerator = null;
+            IMMDevice device = null;
+            try
+            {
+                enumerator = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
+                int hr = enumerator.GetDefaultAudioEndpoint(EDataFlow.eRender, ERole.eMultimedia, out device);
+                if (hr != 0 || device == null)
+                {
+                    return null;
+                }
+
+                string id;
+                device.GetId(out id);
+                DEVICE_STATE state;
+                device.GetState(out state);
+                return new AudioEndpointRecord
+                {
+                    Name = GetFriendlyName(device),
+                    Id = id,
+                    State = state.ToString()
+                };
+            }
+            finally
+            {
+                ReleaseCom(device);
+                ReleaseCom(enumerator);
+            }
+        }
+
+        public static bool DefaultRenderEndpointMatches(string namePattern)
+        {
+            AudioEndpointRecord endpoint = GetDefaultRenderEndpoint();
+            return endpoint != null &&
+                endpoint.Name != null &&
+                endpoint.Name.IndexOf(namePattern, StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
         public static bool SetDefaultRenderEndpointByName(string namePattern, bool includeCommunications)
         {
             List<AudioEndpointRecord> records = ListRenderEndpoints();
@@ -721,6 +762,78 @@ function Write-OperationResults {
     }
 }
 
+function Get-DefaultRenderEndpointName {
+    $endpoint = [AirPodsSwitch.AudioTools]::GetDefaultRenderEndpoint()
+    if ($null -eq $endpoint -or -not $endpoint.Name) {
+        return ""
+    }
+
+    return $endpoint.Name
+}
+
+function Set-VerifiedDefaultEndpoint {
+    param([string]$Pattern)
+
+    if (-not $Pattern) {
+        return $true
+    }
+
+    $retryMs = [Math]::Max(250, $EndpointRetryMs)
+    $deadline = (Get-Date).AddSeconds([Math]::Max(1, $EndpointReadyTimeoutSeconds))
+    $reportedWaiting = $false
+
+    do {
+        $activeMatches = @(
+            [AirPodsSwitch.AudioTools]::ListRenderEndpoints() |
+                Where-Object {
+                    $_.Name -and
+                    $_.Name.IndexOf($Pattern, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+                    $_.State.IndexOf("ACTIVE", [StringComparison]::OrdinalIgnoreCase) -ge 0
+                }
+        )
+
+        if ($activeMatches.Count -gt 0) {
+            $switched = [AirPodsSwitch.AudioTools]::SetDefaultRenderEndpointByName($Pattern, [bool]$SetCommunicationsDefault)
+            Start-Sleep -Milliseconds 300
+            $defaultEndpoint = [AirPodsSwitch.AudioTools]::GetDefaultRenderEndpoint()
+            if ($switched -and
+                $null -ne $defaultEndpoint -and
+                $defaultEndpoint.Name -and
+                $defaultEndpoint.Name.IndexOf($Pattern, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                Write-Host ("Verified default Windows output: {0}" -f $defaultEndpoint.Name)
+                return $true
+            }
+        } elseif (-not $reportedWaiting) {
+            Write-Host ("Waiting for active Windows audio endpoint matching '{0}'..." -f $Pattern)
+            $reportedWaiting = $true
+        }
+
+        Start-Sleep -Milliseconds $retryMs
+    } while ((Get-Date) -lt $deadline)
+
+    $defaultName = Get-DefaultRenderEndpointName
+    if (-not $defaultName) {
+        $defaultName = "<none>"
+    }
+
+    Write-Host ("Switch verification failed. Current default output: {0}" -f $defaultName)
+    $matches = @(
+        [AirPodsSwitch.AudioTools]::ListRenderEndpoints() |
+            Where-Object { $_.Name -and $_.Name.IndexOf($Pattern, [StringComparison]::OrdinalIgnoreCase) -ge 0 }
+    )
+
+    if ($matches.Count -gt 0) {
+        Write-Host "Matching Windows audio endpoints:"
+        $matches | ForEach-Object {
+            Write-Host ("  {0} [{1}]" -f $_.Name, $_.State)
+        }
+    } else {
+        Write-Host ("No Windows audio endpoint matched '{0}'." -f $Pattern)
+    }
+
+    return $false
+}
+
 function Connect-MatchedHeadphones {
     if ($ForceReconnect) {
         Write-Host "Forcing Bluetooth audio service refresh for '$DeviceNamePattern'..."
@@ -733,15 +846,14 @@ function Connect-MatchedHeadphones {
     $on = [AirPodsSwitch.BluetoothTools]::SetAudioStateByName($DeviceNamePattern, $true, [bool]$SetCommunicationsDefault)
     Write-OperationResults $on
 
-    Start-Sleep -Milliseconds 1800
-    if ($AudioEndpointNamePattern) {
-        $switched = [AirPodsSwitch.AudioTools]::SetDefaultRenderEndpointByName($AudioEndpointNamePattern, [bool]$SetCommunicationsDefault)
-        if ($switched) {
-            Write-Host "Default Windows output changed to endpoint matching '$AudioEndpointNamePattern'."
-        } else {
-            Write-Host "No active audio endpoint matched '$AudioEndpointNamePattern' yet."
-        }
+    $serviceSuccess = @($on | Where-Object { $_.Success }).Count -gt 0
+    if (-not $serviceSuccess) {
+        Write-Host ("No Bluetooth audio service was enabled for '{0}'." -f $DeviceNamePattern)
+        return $false
     }
+
+    Start-Sleep -Milliseconds 800
+    return (Set-VerifiedDefaultEndpoint $AudioEndpointNamePattern)
 }
 
 if ($ListDevices) {
@@ -758,13 +870,17 @@ if ($ListDevices) {
 
     $peak = [AirPodsSwitch.AudioTools]::GetDefaultRenderPeak()
     Write-Host ""
+    Write-Host ("Current default render endpoint: {0}" -f (Get-DefaultRenderEndpointName))
     Write-Host ("Current default render peak: {0:N4}" -f $peak)
     exit 0
 }
 
 if ($ConnectNow) {
-    Connect-MatchedHeadphones
-    exit 0
+    $ok = Connect-MatchedHeadphones
+    if ($ok) {
+        exit 0
+    }
+    exit 2
 }
 
 if ($DisconnectNow) {
@@ -798,7 +914,7 @@ while ($true) {
     $cooldownPassed = (($now - $lastConnect).TotalSeconds -ge $CooldownSeconds)
     if ($consecutiveActive -ge $ActiveSamples -and $cooldownPassed) {
         Write-Host ("Audio detected at {0:T}; peak={1:N4}" -f $now, $peak)
-        Connect-MatchedHeadphones
+        [void](Connect-MatchedHeadphones)
         $lastConnect = Get-Date
         $consecutiveActive = 0
 
